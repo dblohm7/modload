@@ -190,7 +190,7 @@ FindFirefox(std::wstring& aOutFirefoxPath)
 static bool
 GetTargetModule(std::wstring& aOutTargetModule)
 {
-  return true;
+  return false;
 }
 
 static const wchar_t* kCmdLineSwitches[] {
@@ -205,7 +205,7 @@ GetBinaries(int aArgc, LPWSTR* aArgv, std::wstring& aOutFirefoxPath,
   aOutFirefoxPath.clear();
   aOutTargetModule.clear();
 
-  for (int i = 1; i < aArgc; ++i) {
+  for (int i = 0; i < aArgc; ++i) {
     if (!wcscmp(aArgv[i], kCmdLineSwitches[0]) && (i + 1) < aArgc) {
       aOutTargetModule = aArgv[i + 1];
       ++i;
@@ -288,8 +288,14 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
     return 2;
   }
 
-  std::wstring output(firefoxBinary);
-  output += L'\n';
+  std::wstring output(L"Firefox Binary: \"");
+  output += firefoxBinary;
+  output += L"\"\n";
+  ::OutputDebugStringW(output.c_str());
+
+  output = L"Desired module: \"";
+  output += targetModule;
+  output += L"\"\n";
   ::OutputDebugStringW(output.c_str());
 
   return 0;
