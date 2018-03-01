@@ -135,46 +135,6 @@ GetCurrentContext(const PROCESS_INFORMATION& aProcInfo,
   return true;
 }
 
-class AutoVirtualProtect final
-{
-public:
-  AutoVirtualProtect(HANDLE aProcess, void* aAddr, SIZE_T aLen, DWORD aNewProt)
-    : mProcess(aProcess)
-    , mDoRevert(FALSE)
-    , mAddr(aAddr)
-    , mLen(aLen)
-    , mPrevProt(0)
-  {
-    mDoRevert = ::VirtualProtectEx(aProcess, aAddr, aLen, aNewProt, &mPrevProt);
-  }
-
-  ~AutoVirtualProtect()
-  {
-    if (!mDoRevert) {
-      return;
-    }
-
-    ::VirtualProtectEx(mProcess, mAddr, mLen, mPrevProt, &mPrevProt);
-  }
-
-  explicit operator bool() const
-  {
-    return !!mDoRevert;
-  }
-
-  AutoVirtualProtect(const AutoVirtualProtect&) = delete;
-  AutoVirtualProtect(AutoVirtualProtect&&) = delete;
-  AutoVirtualProtect& operator=(const AutoVirtualProtect&) = delete;
-  AutoVirtualProtect& operator=(AutoVirtualProtect&&) = delete;
-
-private:
-  HANDLE  mProcess;
-  BOOL    mDoRevert;
-  void*   mAddr;
-  SIZE_T  mLen;
-  DWORD   mPrevProt;
-};
-
 static void
 OnDllLoad(const DEBUG_EVENT& aDbgEvt, const DebuggerContext& aDbgCtx,
           const PROCESS_INFORMATION& aProcInfo)
@@ -207,37 +167,6 @@ OnDllLoad(const DEBUG_EVENT& aDbgEvt, const DebuggerContext& aDbgCtx,
   if (pos == std::wstring::npos) {
     return;
   }
-
-#if 0
-  // Let's poke a breakpoint into the process
-  // This can't work if stuff is loaded before the crash reporter.
-  CrossPlatformContext ctx;
-  if (!GetCurrentContext(aProcInfo, ctx)) {
-    return;
-  }
-
-  std::wostringstream oss2;
-  oss2 << L"Writing breakpoint to location 0x" << std::hex << ctx.mPc << L"\n";
-  ::OutputDebugStringW(oss2.str().c_str());
-
-  void* address = reinterpret_cast<void*>(ctx.mPc);
-
-  const BYTE kBreakpointOpcode = 0xCC;
-
-  AutoVirtualProtect prot(aProcInfo.hProcess, address, sizeof(kBreakpointOpcode),
-                          PAGE_EXECUTE_READWRITE);
-  if (!prot) {
-    return;
-  }
-
-  SIZE_T bytesWritten = 0;
-  BOOL ok = ::WriteProcessMemory(aProcInfo.hProcess, address,
-                                 &kBreakpointOpcode, sizeof(kBreakpointOpcode),
-                                 &bytesWritten);
-  if (!ok || bytesWritten != sizeof(kBreakpointOpcode)) {
-    return;
-  }
-#endif
 
   time_t now = time(nullptr);
   struct tm crackedNow;
@@ -288,33 +217,8 @@ OnDllLoad(const DEBUG_EVENT& aDbgEvt, const DebuggerContext& aDbgCtx,
     return;
   }
 
-#if 0
-  // Get the context of the suspended thread
-  STACKFRAME64 stackFrame{};
-  stackFrame.AddrPC.Mode = AddrModeFlat;
-  stackFrame.AddrFrame.Mode = AddrModeFlat;
-  stackFrame.AddrStack.Mode = AddrModeFlat;
-
-  CrossPlatformContext ctx;
-  if (!GetCurrentContext(aProcInfo, ctx)) {
-    return;
-  }
-
-  DWORD machineType = ctx.mIsWow64 ? IMAGE_FILE_MACHINE_I386 :
-                                     IMAGE_FILE_MACHINE_AMD64;
-
-  stackFrame.AddrPC.Offset = ctx.mPc;
-  stackFrame.AddrFrame.Offset = ctx.mFp;
-  stackFrame.AddrStack.Offset = ctx.mSp;
-
-  // TODO ASK: SymInitialize
-
-  // We've found the module we're interested in. Pull that thread's call stack.
-  BOOL ok = ::StackWalk64(machineType, aProcInfo.hProcess, aProcInfo.hThread,
-                          &stackFrame, aIsWow64 ? &ctx32 : &ctx64, nullptr,
-                          &::SymFunctionTableAccess64, &::SymGetModuleBase64,
-                          nullptr);
-#endif
+  // TODO ASK: Write final name and success code to debug context so we can
+  //           display a TaskDialog to the user at the end.
 }
 
 static unsigned __stdcall
@@ -500,8 +404,7 @@ FindFirefox(std::wstring& aOutFirefoxPath)
   }
 
   options |= FOS_STRICTFILETYPES | FOS_FORCEFILESYSTEM |
-             FOS_FILEMUSTEXIST | /*FOS_SHAREAWARE |*/
-             FOS_DONTADDTORECENT;
+             FOS_FILEMUSTEXIST | FOS_DONTADDTORECENT;
 
   hr = picker->SetOptions(options);
   if (FAILED(hr)) {
