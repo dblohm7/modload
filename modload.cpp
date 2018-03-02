@@ -8,11 +8,13 @@
 #include <shlwapi.h>
 
 #include <algorithm>
+#include <array>
 #include <iomanip>
 #include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <string.h>
 #include <time.h>
@@ -60,6 +62,14 @@ struct KernelHandleDeleter
   }
 };
 
+struct UpdateResourceDeleter
+{
+  void operator()(HANDLE aHandle)
+  {
+    ::EndUpdateResource(aHandle, FALSE);
+  }
+};
+
 template <typename T, size_t N>
 size_t ArrayLength(T (&aArray)[N])
 {
@@ -70,6 +80,7 @@ typedef std::unique_ptr<wchar_t, LocalFreeDeleter> UniquePathPtr;
 typedef std::unique_ptr<LPWSTR, LocalFreeDeleter> UniqueArgvPtr;
 typedef std::unique_ptr<wchar_t, ComDeleter> UniqueComStringPtr;
 typedef std::unique_ptr<void, KernelHandleDeleter> UniqueKernelHandle;
+typedef std::unique_ptr<void, UpdateResourceDeleter> UniqueResHandle;
 
 _COM_SMARTPTR_TYPEDEF(IApplicationAssociationRegistration,
                       IID_IApplicationAssociationRegistration);
@@ -79,6 +90,18 @@ _COM_SMARTPTR_TYPEDEF(IShellItem, IID_IShellItem);
 
 struct DebuggerContext
 {
+  enum class Op
+  {
+    CaptureDump,
+    GenerateBin
+  };
+
+  DebuggerContext()
+    : mOp(Op::CaptureDump)
+  {
+  }
+
+  Op            mOp;
   std::wstring  mFirefoxPath;
   std::wstring  mCommandLineOptions;
   std::wstring  mModuleName;
@@ -98,6 +121,122 @@ struct CrossPlatformContext
   uint64_t  mSp;
   uint64_t  mFp;
 };
+
+class DeleteOnFail final
+{
+public:
+  explicit DeleteOnFail(const wchar_t* aName)
+    : mFileName(aName)
+    , mSucceeded(false)
+  {
+  }
+
+  ~DeleteOnFail()
+  {
+    if (mSucceeded) {
+      return;
+    }
+
+    ::DeleteFile(mFileName.c_str());
+  }
+
+  void Succeeded()
+  {
+    mSucceeded = true;
+  }
+
+  DeleteOnFail(const DeleteOnFail&) = delete;
+  DeleteOnFail(DeleteOnFail&&) = delete;
+  DeleteOnFail& operator=(const DeleteOnFail&) = delete;
+  DeleteOnFail& operator=(DeleteOnFail&&) = delete;
+
+private:
+  std::wstring  mFileName;
+  bool          mSucceeded;
+};
+
+enum class ResId : WORD
+{
+  TargetModuleName = 0
+};
+
+static std::vector<wchar_t>
+BuildStringTable(const std::array<std::wstring, 16>& aStrings)
+{
+  std::vector<wchar_t> result;
+
+  for (auto&& str : aStrings) {
+    result.push_back(str.length());
+    std::copy(str.begin(), str.end(), std::back_inserter(result));
+  }
+
+  return result;
+}
+
+static bool
+GenerateBinaryWithResources(const DebuggerContext& aDbgCtx)
+{
+  if (aDbgCtx.mModuleName.empty()) {
+    return false;
+  }
+
+  wchar_t curExeName[MAX_PATH + 1] = {};
+  DWORD result = ::GetModuleFileName(nullptr, curExeName, ArrayLength(curExeName));
+  if (!result || result == ArrayLength(curExeName)) {
+    return false;
+  }
+
+  wchar_t newExeName[MAX_PATH + 1] = {};
+  if (wcscpy_s(newExeName, ArrayLength(newExeName), curExeName)) {
+    return false;
+  }
+
+  HRESULT hr = ::PathCchRemoveExtension(newExeName, ArrayLength(newExeName));
+  if (FAILED(hr)) {
+    return false;
+  }
+
+  std::wstring suffix;
+  suffix += L'-';
+  suffix += aDbgCtx.mModuleName;
+  suffix += L".exe";
+
+  if (wcscat_s(newExeName, ArrayLength(newExeName), suffix.c_str())) {
+    return false;
+  }
+
+  if (!::CopyFile(curExeName, newExeName, TRUE)) {
+    return false;
+  }
+
+  { // So that we've committed the resources by the time we show UI
+    DeleteOnFail del(newExeName);
+    UniqueResHandle res(::BeginUpdateResource(newExeName, FALSE));
+    if (!res) {
+      return false;
+    }
+
+    std::array<std::wstring, 16> strings;
+    strings[static_cast<WORD>(ResId::TargetModuleName)] = aDbgCtx.mModuleName;
+
+    std::vector<wchar_t> stringTable(BuildStringTable(strings));
+    if (!::UpdateResource(res.get(), RT_STRING, MAKEINTRESOURCE(1),
+                          MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
+                          &stringTable[0], stringTable.size() * sizeof(wchar_t))) {
+      return false;
+    }
+
+    del.Succeeded();
+  }
+
+  std::wostringstream oss;
+  oss << L"Successfully created \"" << newExeName << L"\"";
+
+  ::MessageBox(nullptr, oss.str().c_str(), L"Binary Generation Complete",
+               MB_OK | MB_ICONASTERISK);
+
+  return true;
+}
 
 static bool
 GetCurrentContext(const PROCESS_INFORMATION& aProcInfo,
@@ -510,7 +649,18 @@ GetDumpPath(std::wstring& aOutDumpPath)
 static bool
 GetTargetModule(std::wstring& aOutTargetModule)
 {
-  return false;
+  aOutTargetModule.clear();
+
+  wchar_t buf[MAX_PATH + 1] = {};
+  if (!::LoadString(::GetModuleHandle(nullptr),
+                    static_cast<WORD>(ResId::TargetModuleName),
+                    buf, ArrayLength(buf))) {
+    return false;
+  }
+
+  aOutTargetModule = buf;
+
+  return true;
 }
 
 static const wchar_t* kCmdLineSwitches[] {
@@ -560,6 +710,14 @@ GetLocations(int aArgc, LPWSTR* aArgv, DebuggerContext& aDbgCtx)
       ++i;
       continue;
     }
+
+    if (!wcscmp(aArgv[i], L"--modload-generate-binary")) {
+      aDbgCtx.mOp = DebuggerContext::Op::GenerateBin;
+    }
+  }
+
+  if (aDbgCtx.mOp == DebuggerContext::Op::GenerateBin) {
+    return true;
   }
 
   bool success = true;
@@ -663,20 +821,27 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
   output += L"\"\n";
   ::OutputDebugStringW(output.c_str());
 
+  if (dbgctx.mOp == DebuggerContext::Op::GenerateBin) {
+    if (!GenerateBinaryWithResources(dbgctx)) {
+      return 3;
+    }
+    return 0;
+  }
+
   BuildDebugeeCommandLineOptions(argc, argv.get(), dbgctx.mCommandLineOptions);
 
   unsigned tid;
   UniqueKernelHandle handle(reinterpret_cast<HANDLE>(
     _beginthreadex(nullptr, 0, &DebuggerThread, &dbgctx, 0, &tid)));
   if (!handle) {
-    return 3;
+    return 4;
   }
 
   HANDLE waitHandle = handle.get();
   DWORD waitIndex;
   HRESULT hr = ::CoWaitForMultipleHandles(0, INFINITE, 1, &waitHandle, &waitIndex);
   if (FAILED(hr)) {
-    return 4;
+    return 5;
   }
 
   return 0;
