@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <commctrl.h>
 #include <dbghelp.h>
 #include <objbase.h>
 #include <pathcch.h>
@@ -6,6 +7,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <uxtheme.h>
+#include <vsstyle.h>
 
 #include <algorithm>
 #include <array>
@@ -14,6 +17,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <string.h>
@@ -23,10 +27,13 @@
 #include <comip.h>
 #include <process.h>
 
+#pragma comment(lib, "comctl32")
 #pragma comment(lib, "dbghelp")
+#pragma comment(lib, "gdi32")
 #pragma comment(lib, "pathcch")
 #pragma comment(lib, "shell32")
 #pragma comment(lib, "shlwapi")
+#pragma comment(lib, "uxtheme")
 
 #if !defined(_M_X64)
 #error 64-bit build only
@@ -70,6 +77,22 @@ struct UpdateResourceDeleter
   }
 };
 
+struct ThemeDeleter
+{
+  void operator()(HTHEME aTheme)
+  {
+    ::CloseThemeData(aTheme);
+  }
+};
+
+struct DCDeleter
+{
+  void operator()(HDC aDc)
+  {
+    ::ReleaseDC(nullptr, aDc);
+  }
+};
+
 template <typename T, size_t N>
 size_t ArrayLength(T (&aArray)[N])
 {
@@ -81,6 +104,8 @@ typedef std::unique_ptr<LPWSTR, LocalFreeDeleter> UniqueArgvPtr;
 typedef std::unique_ptr<wchar_t, ComDeleter> UniqueComStringPtr;
 typedef std::unique_ptr<void, KernelHandleDeleter> UniqueKernelHandle;
 typedef std::unique_ptr<void, UpdateResourceDeleter> UniqueResHandle;
+typedef std::unique_ptr<std::remove_pointer<HTHEME>::type, ThemeDeleter> UniqueThemeHandle;
+typedef std::unique_ptr<std::remove_pointer<HDC>::type, DCDeleter> UniqueDC;
 
 _COM_SMARTPTR_TYPEDEF(IApplicationAssociationRegistration,
                       IID_IApplicationAssociationRegistration);
@@ -106,6 +131,7 @@ struct DebuggerContext
   std::wstring  mCommandLineOptions;
   std::wstring  mModuleName;
   std::wstring  mDumpPath;
+  std::wstring  mFinalDumpPath;
 };
 
 struct CrossPlatformContext
@@ -275,7 +301,7 @@ GetCurrentContext(const PROCESS_INFORMATION& aProcInfo,
 }
 
 static void
-OnDllLoad(const DEBUG_EVENT& aDbgEvt, const DebuggerContext& aDbgCtx,
+OnDllLoad(const DEBUG_EVENT& aDbgEvt, DebuggerContext& aDbgCtx,
           const PROCESS_INFORMATION& aProcInfo)
 {
   HANDLE file = aDbgEvt.u.LoadDll.hFile;
@@ -337,6 +363,7 @@ OnDllLoad(const DEBUG_EVENT& aDbgEvt, const DebuggerContext& aDbgCtx,
   dumpPathMsg << L"Writing dump to \"" << fullDumpPath << L"\"\n";
   ::OutputDebugStringW(dumpPathMsg.str().c_str());
 
+  DeleteOnFail del(fullDumpPath.c_str());
   UniqueKernelHandle dumpFile(
     ::CreateFile(fullDumpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                  FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -356,8 +383,9 @@ OnDllLoad(const DEBUG_EVENT& aDbgEvt, const DebuggerContext& aDbgCtx,
     return;
   }
 
-  // TODO ASK: Write final name and success code to debug context so we can
-  //           display a TaskDialog to the user at the end.
+  del.Succeeded();
+
+  aDbgCtx.mFinalDumpPath = fullDumpPath;
 }
 
 static unsigned __stdcall
@@ -806,9 +834,14 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
 
   STARegion sta;
 
+  INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+  if (!::InitCommonControlsEx(&icc)) {
+    return 2;
+  }
+
   DebuggerContext dbgctx;
   if (!GetLocations(argc, argv.get(), dbgctx)) {
-    return 2;
+    return 3;
   }
 
   std::wstring output(L"Firefox Binary: \"");
@@ -823,7 +856,7 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
 
   if (dbgctx.mOp == DebuggerContext::Op::GenerateBin) {
     if (!GenerateBinaryWithResources(dbgctx)) {
-      return 3;
+      return 4;
     }
     return 0;
   }
@@ -834,14 +867,63 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
   UniqueKernelHandle handle(reinterpret_cast<HANDLE>(
     _beginthreadex(nullptr, 0, &DebuggerThread, &dbgctx, 0, &tid)));
   if (!handle) {
-    return 4;
+    return 5;
   }
 
   HANDLE waitHandle = handle.get();
   DWORD waitIndex;
   HRESULT hr = ::CoWaitForMultipleHandles(0, INFINITE, 1, &waitHandle, &waitIndex);
   if (FAILED(hr)) {
-    return 5;
+    return 6;
+  }
+
+  DWORD exitCode;
+  if (!::GetExitCodeThread(waitHandle, &exitCode)) {
+    return 7;
+  }
+
+  if (exitCode) {
+    return static_cast<int>(exitCode) << 16;
+  }
+
+  if (dbgctx.mFinalDumpPath.empty()) {
+    return 8;
+  }
+
+  UniqueThemeHandle theme(::OpenThemeData(nullptr, L"TaskDialog"));
+  if (!theme) {
+    return 9;
+  }
+
+  UniqueDC dc(::GetDC(nullptr));
+  if (!dc) {
+    return 10;
+  }
+
+  RECT textRect;
+  hr = ::GetThemeTextExtent(theme.get(), dc.get(), TDLG_CONTENTPANE, 0,
+                            dbgctx.mFinalDumpPath.c_str(),
+                            dbgctx.mFinalDumpPath.length(),
+                            DT_CALCRECT | DT_LEFT, nullptr, &textRect);
+  if (FAILED(hr)) {
+    return 11;
+  }
+
+  WORD dlgBaseUnitX = LOWORD(::GetDialogBaseUnits());
+  // Convert pixels in textRect to dialog units
+  UINT dlgWidth = ::MulDiv((textRect.right - textRect.left), 4, dlgBaseUnitX);
+
+  TASKDIALOGCONFIG taskDlgCfg = { sizeof(taskDlgCfg) };
+  taskDlgCfg.dwCommonButtons = TDCBF_OK_BUTTON;
+  taskDlgCfg.pszWindowTitle = L"Dump Complete";
+  taskDlgCfg.pszMainIcon = TD_INFORMATION_ICON;
+  taskDlgCfg.pszMainInstruction = L"Please send this dump file to Mozilla Support";
+  taskDlgCfg.pszContent = dbgctx.mFinalDumpPath.c_str();
+  taskDlgCfg.nDefaultButton = IDOK;
+  taskDlgCfg.cxWidth = dlgWidth;
+  hr = ::TaskDialogIndirect(&taskDlgCfg, nullptr, nullptr, nullptr);
+  if (FAILED(hr)) {
+    return 12;
   }
 
   return 0;
