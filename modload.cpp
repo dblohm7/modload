@@ -137,13 +137,16 @@ ShowInfoDialog(const std::wstring& aCaption,
                const std::wstring& aContentMsg)
 {
   TASKDIALOGCONFIG taskDlgCfg = { sizeof(taskDlgCfg) };
-  taskDlgCfg.dwFlags = TDF_SIZE_TO_CONTENT;
   taskDlgCfg.dwCommonButtons = TDCBF_OK_BUTTON;
   taskDlgCfg.pszWindowTitle = aCaption.c_str();
   taskDlgCfg.pszMainIcon = TD_INFORMATION_ICON;
   taskDlgCfg.pszMainInstruction = aMainInstruction.c_str();
-  taskDlgCfg.pszContent = aContentMsg.empty() ? nullptr : aContentMsg.c_str();
   taskDlgCfg.nDefaultButton = IDOK;
+
+  if (!aContentMsg.empty()) {
+    taskDlgCfg.dwFlags = TDF_SIZE_TO_CONTENT;
+    taskDlgCfg.pszContent = aContentMsg.c_str();
+  }
 
   return SUCCEEDED(::TaskDialogIndirect(&taskDlgCfg, nullptr, nullptr, nullptr));
 }
@@ -808,6 +811,11 @@ public:
     ::CoUninitialize();
   }
 
+  explicit operator bool() const
+  {
+    return SUCCEEDED(mResult);
+  }
+
   COMRegion(const COMRegion&) = delete;
   COMRegion(COMRegion&&) = delete;
   COMRegion& operator=(const COMRegion&) = delete;
@@ -831,15 +839,18 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
   }
 
   STARegion sta;
+  if (!sta) {
+    return 2;
+  }
 
   INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
   if (!::InitCommonControlsEx(&icc)) {
-    return 2;
+    return 3;
   }
 
   DebuggerContext dbgctx;
   if (!GetLocations(argc, argv.get(), dbgctx)) {
-    return 3;
+    return 4;
   }
 
   std::wstring output(L"Firefox Binary: \"");
@@ -854,7 +865,7 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
 
   if (dbgctx.mOp == DebuggerContext::Op::GenerateBin) {
     if (!GenerateBinaryWithResources(dbgctx)) {
-      return 4;
+      return 5;
     }
     return 0;
   }
@@ -865,19 +876,19 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
   UniqueKernelHandle handle(reinterpret_cast<HANDLE>(
     _beginthreadex(nullptr, 0, &DebuggerThread, &dbgctx, 0, &tid)));
   if (!handle) {
-    return 5;
+    return 6;
   }
 
   HANDLE waitHandle = handle.get();
   DWORD waitIndex;
   HRESULT hr = ::CoWaitForMultipleHandles(0, INFINITE, 1, &waitHandle, &waitIndex);
   if (FAILED(hr)) {
-    return 6;
+    return 7;
   }
 
   DWORD exitCode;
   if (!::GetExitCodeThread(waitHandle, &exitCode)) {
-    return 7;
+    return 8;
   }
 
   if (exitCode) {
@@ -885,13 +896,13 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
   }
 
   if (dbgctx.mFinalDumpPath.empty()) {
-    return 8;
+    return 9;
   }
 
   if (!ShowInfoDialog(L"Dump Complete",
                       L"Please send this dump file to Mozilla Support",
                       dbgctx.mFinalDumpPath)) {
-    return 9;
+    return 10;
   }
 
   return 0;
