@@ -7,8 +7,6 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
-#include <uxtheme.h>
-#include <vsstyle.h>
 
 #include <algorithm>
 #include <array>
@@ -33,7 +31,6 @@
 #pragma comment(lib, "pathcch")
 #pragma comment(lib, "shell32")
 #pragma comment(lib, "shlwapi")
-#pragma comment(lib, "uxtheme")
 
 #if !defined(_M_X64)
 #error 64-bit build only
@@ -77,22 +74,6 @@ struct UpdateResourceDeleter
   }
 };
 
-struct ThemeDeleter
-{
-  void operator()(HTHEME aTheme)
-  {
-    ::CloseThemeData(aTheme);
-  }
-};
-
-struct DCDeleter
-{
-  void operator()(HDC aDc)
-  {
-    ::ReleaseDC(nullptr, aDc);
-  }
-};
-
 template <typename T, size_t N>
 size_t ArrayLength(T (&aArray)[N])
 {
@@ -104,8 +85,6 @@ typedef std::unique_ptr<LPWSTR, LocalFreeDeleter> UniqueArgvPtr;
 typedef std::unique_ptr<wchar_t, ComDeleter> UniqueComStringPtr;
 typedef std::unique_ptr<void, KernelHandleDeleter> UniqueKernelHandle;
 typedef std::unique_ptr<void, UpdateResourceDeleter> UniqueResHandle;
-typedef std::unique_ptr<std::remove_pointer<HTHEME>::type, ThemeDeleter> UniqueThemeHandle;
-typedef std::unique_ptr<std::remove_pointer<HDC>::type, DCDeleter> UniqueDC;
 
 _COM_SMARTPTR_TYPEDEF(IApplicationAssociationRegistration,
                       IID_IApplicationAssociationRegistration);
@@ -147,6 +126,27 @@ struct CrossPlatformContext
   uint64_t  mSp;
   uint64_t  mFp;
 };
+
+/**
+ * This function sets the width of the task dialog to the width of aContentMsg
+ * to prevent that message from being shortened via ellipsis.
+ */
+static bool
+ShowInfoDialog(const std::wstring& aCaption,
+               const std::wstring& aMainInstruction,
+               const std::wstring& aContentMsg)
+{
+  TASKDIALOGCONFIG taskDlgCfg = { sizeof(taskDlgCfg) };
+  taskDlgCfg.dwFlags = TDF_SIZE_TO_CONTENT;
+  taskDlgCfg.dwCommonButtons = TDCBF_OK_BUTTON;
+  taskDlgCfg.pszWindowTitle = aCaption.c_str();
+  taskDlgCfg.pszMainIcon = TD_INFORMATION_ICON;
+  taskDlgCfg.pszMainInstruction = aMainInstruction.c_str();
+  taskDlgCfg.pszContent = aContentMsg.empty() ? nullptr : aContentMsg.c_str();
+  taskDlgCfg.nDefaultButton = IDOK;
+
+  return SUCCEEDED(::TaskDialogIndirect(&taskDlgCfg, nullptr, nullptr, nullptr));
+}
 
 class DeleteOnFail final
 {
@@ -255,11 +255,9 @@ GenerateBinaryWithResources(const DebuggerContext& aDbgCtx)
     del.Succeeded();
   }
 
-  std::wostringstream oss;
-  oss << L"Successfully created \"" << newExeName << L"\"";
-
-  ::MessageBox(nullptr, oss.str().c_str(), L"Binary Generation Complete",
-               MB_OK | MB_ICONASTERISK);
+  ShowInfoDialog(L"Binary Generation Complete",
+                 L"Send the following binary to the user:",
+                 newExeName);
 
   return true;
 }
@@ -890,40 +888,10 @@ wWinMain(HINSTANCE aInstance, HINSTANCE aPrevInstance, PWSTR aCmdLine,
     return 8;
   }
 
-  UniqueThemeHandle theme(::OpenThemeData(nullptr, L"TaskDialog"));
-  if (!theme) {
+  if (!ShowInfoDialog(L"Dump Complete",
+                      L"Please send this dump file to Mozilla Support",
+                      dbgctx.mFinalDumpPath)) {
     return 9;
-  }
-
-  UniqueDC dc(::GetDC(nullptr));
-  if (!dc) {
-    return 10;
-  }
-
-  RECT textRect;
-  hr = ::GetThemeTextExtent(theme.get(), dc.get(), TDLG_CONTENTPANE, 0,
-                            dbgctx.mFinalDumpPath.c_str(),
-                            dbgctx.mFinalDumpPath.length(),
-                            DT_CALCRECT | DT_LEFT, nullptr, &textRect);
-  if (FAILED(hr)) {
-    return 11;
-  }
-
-  WORD dlgBaseUnitX = LOWORD(::GetDialogBaseUnits());
-  // Convert pixels in textRect to dialog units
-  UINT dlgWidth = ::MulDiv((textRect.right - textRect.left), 4, dlgBaseUnitX);
-
-  TASKDIALOGCONFIG taskDlgCfg = { sizeof(taskDlgCfg) };
-  taskDlgCfg.dwCommonButtons = TDCBF_OK_BUTTON;
-  taskDlgCfg.pszWindowTitle = L"Dump Complete";
-  taskDlgCfg.pszMainIcon = TD_INFORMATION_ICON;
-  taskDlgCfg.pszMainInstruction = L"Please send this dump file to Mozilla Support";
-  taskDlgCfg.pszContent = dbgctx.mFinalDumpPath.c_str();
-  taskDlgCfg.nDefaultButton = IDOK;
-  taskDlgCfg.cxWidth = dlgWidth;
-  hr = ::TaskDialogIndirect(&taskDlgCfg, nullptr, nullptr, nullptr);
-  if (FAILED(hr)) {
-    return 12;
   }
 
   return 0;
