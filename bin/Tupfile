@@ -1,2 +1,6 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 .gitignore
 : ../obj/*.obj | ../obj/*.pdb |> cl -Zi -MT %f -FS -Fd%O.pdb -Fe%o -link -manifestinput:../src/compatibility.manifest -manifest:embed |> modload.exe | %O.pdb %O.ilk
