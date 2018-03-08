@@ -1,0 +1,2 @@
+.gitignore
+: ../obj/*.obj | ../obj/*.pdb |> cl -Zi -MT %f -FS -Fd%O.pdb -Fe%o -link -manifestinput:../src/compatibility.manifest -manifest:embed |> modload.exe | %O.pdb %O.ilk
